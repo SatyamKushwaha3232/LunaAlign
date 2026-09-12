@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Environment
+.env
+.env.*
+
+# Generated data
+backend/data/input/*
+backend/data/output/*
+
+# Keep data folders
+!backend/data/input/.gitkeep
+!backend/data/output/.gitkeep
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
