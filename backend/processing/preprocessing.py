@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 
 
 def load_image(image_path: str):
@@ -32,6 +33,52 @@ def denoise_image(gray):
     return denoised
 
 
+def estimate_illumination(gray):
+    """
+    Estimate the slowly varying illumination field.
+
+    Lunar images can contain large brightness variations
+    caused by changing solar illumination and shadows.
+
+    A large Gaussian blur is used as a simple illumination model.
+    """
+
+    illumination = cv2.GaussianBlur(
+        gray,
+        (0, 0),
+        sigmaX=25,
+        sigmaY=25
+    )
+
+    return illumination
+
+
+def normalize_illumination(gray, illumination):
+    """
+    Normalize illumination using a Retinex-style division model.
+
+    This reduces large-scale brightness differences while
+    preserving local surface structures and crater boundaries.
+    """
+
+    gray_float = gray.astype(np.float32) + 1.0
+    illumination_float = illumination.astype(np.float32) + 1.0
+
+    normalized = gray_float / illumination_float
+
+    normalized = cv2.normalize(
+        normalized,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
+
+    normalized = normalized.astype(np.uint8)
+
+    return normalized
+
+
 def enhance_contrast(gray):
     """
     Enhance local contrast using CLAHE.
@@ -56,11 +103,19 @@ def preprocess_image(image_path: str):
 
     Image
       ↓
+    Load Image
+      ↓
     Grayscale
       ↓
     Denoising
       ↓
-    Contrast Enhancement
+    Illumination Estimation
+      ↓
+    Illumination Normalization
+      ↓
+    CLAHE
+      ↓
+    Normalized Image
     """
 
     image = load_image(image_path)
@@ -69,11 +124,20 @@ def preprocess_image(image_path: str):
 
     denoised = denoise_image(gray)
 
-    enhanced = enhance_contrast(denoised)
+    illumination = estimate_illumination(denoised)
+
+    normalized = normalize_illumination(
+        denoised,
+        illumination
+    )
+
+    enhanced = enhance_contrast(normalized)
 
     return {
         "original": image,
         "grayscale": gray,
         "denoised": denoised,
+        "illumination": illumination,
+        "normalized": normalized,
         "enhanced": enhanced,
     }

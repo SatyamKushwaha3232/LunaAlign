@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Product_Observational>
+
+    <Identification_Area>
+        <logical_identifier>
+            ch2_ohr_ncp_20211228T2209123959_d_img_d18
+        </logical_identifier>
+
+        <product_id>
+            ch2_ohr_ncp_20211228T2209123959_d_img_d18
+        </product_id>
+
+        <product_type>
+            Calibrated
+        </product_type>
+    </Identification_Area>
+
+    <Observation_Area>
+
+        <Time_Coordinates>
+            <start_date_time>
+                2021-12-28T22:09:12
+            </start_date_time>
+        </Time_Coordinates>
+
+        <Mission_Area>
+
+            <sensor>
+                OHRC
+            </sensor>
+
+            <spatial_resolution>
+                0.28 m/pixel
+            </spatial_resolution>
+
+            <sun_azimuth>
+                152.400416
+            </sun_azimuth>
+
+            <sun_elevation>
+                -0.043949
+            </sun_elevation>
+
+        </Mission_Area>
+
+    </Observation_Area>
+
+</Product_Observational>
