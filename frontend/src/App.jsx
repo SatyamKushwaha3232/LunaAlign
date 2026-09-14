@@ -24,7 +24,6 @@ import {
   Layers3,
   Menu,
   Moon,
-  Orbit,
   PanelLeft,
   Play,
   Rocket,
@@ -199,7 +198,11 @@ function Layout({ children }) {
       <aside className={`sidebar ${mobileOpen ? "open" : ""}`}>
         <div className="brand">
           <div className="brand-orb">
-            <Orbit size={22} />
+            <img
+              src="/lunaalign-logo.png"
+              alt="LunaAlign logo"
+              className="brand-logo"
+            />
           </div>
 
           <div>
