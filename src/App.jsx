@@ -42,12 +42,21 @@ import {
    BACKEND CONFIG
 ========================================================= */
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+// Docker/Nginx uses same-origin paths in production. Local Vite development
+// defaults to FastAPI on 8000, unless a different URL is explicitly supplied.
+const BACKEND_URL = import.meta.env.VITE_API_BASE_URL || (
+  import.meta.env.DEV ? "http://127.0.0.1:8000" : ""
+);
 
 const API = {
   upload: `${BACKEND_URL}/api/v1/datasets/upload`,
   datasets: `${BACKEND_URL}/api/v1/datasets`,
   correspondence: `${BACKEND_URL}/api/v1/correspondence`,
+  jobs: `${BACKEND_URL}/api/v1/correspondence/jobs`,
+  job: (jobId) => `${BACKEND_URL}/api/v1/correspondence/jobs/${jobId}`,
+  result: (jobId) => `${BACKEND_URL}/api/v1/correspondence/results/${jobId}`,
+  synthetic: `${BACKEND_URL}/api/v1/correspondence/synthetic`,
+  report: (jobId) => `${BACKEND_URL}/api/v1/correspondence/report/${jobId}`,
 };
 
 /* =========================================================
@@ -75,6 +84,11 @@ const nav = [
     label: "Results",
     icon: BarChart3,
   },
+  {
+    to: "/benchmarks",
+    label: "Benchmarks",
+    icon: Gauge,
+  },
 ];
 
 /* =========================================================
@@ -99,6 +113,18 @@ function getErrorMessage(data, fallback = "Something went wrong.") {
   }
 
   return fallback;
+}
+
+async function readApiJson(response) {
+  const body = await response.text();
+  if (!body.trim()) {
+    throw new Error(`Backend returned an empty response (HTTP ${response.status}). Check that the FastAPI server is running on port 8001.`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`Backend returned an invalid response (HTTP ${response.status}). Check the FastAPI terminal for details.`);
+  }
 }
 
 function getTransformationMatrix(result) {
@@ -139,6 +165,25 @@ function formatNumber(value, digits = 4) {
   }
 
   return number.toFixed(digits);
+}
+
+function saveBenchmark(result) {
+  if (!result?.job_id) return;
+  const existing = JSON.parse(localStorage.getItem("lunaAlginBenchmarks") || "[]");
+  const record = {
+    jobId: result.job_id,
+    label: result.validation ? "Synthetic ground truth" : `${result.input?.reference || "Reference"} ↔ ${result.input?.target || "Target"}`,
+    createdAt: new Date().toISOString(),
+    matches: result.matching?.good_matches ?? 0,
+    inliers: result.geometry?.inliers ?? 0,
+    inlierRatio: result.geometry?.inlier_ratio ?? 0,
+    rmse: result.registration?.quality_metrics?.rmse ?? null,
+    ssim: result.registration?.quality_metrics?.ssim ?? null,
+    ncc: result.registration?.quality_metrics?.ncc ?? null,
+    reprojectionError: result.geometry?.reprojection_error?.mean_error ?? null,
+    cornerRmse: result.validation?.corner_rmse_px ?? null,
+  };
+  localStorage.setItem("lunaAlginBenchmarks", JSON.stringify([record, ...existing.filter((item) => item.jobId !== record.jobId)].slice(0, 50)));
 }
 
 /* =========================================================
@@ -782,6 +827,7 @@ function DropZone({
   label,
   modality,
   onFile,
+  uploadStatus = "idle",
 }) {
   const [file, setFile] =
     useState(null);
@@ -799,7 +845,7 @@ function DropZone({
   return (
     <label
       className={`dropzone ${
-        file ? "has-file" : ""
+        uploadStatus === "uploaded" ? "has-file" : ""
       }`}
     >
       <input
@@ -809,8 +855,10 @@ function DropZone({
       />
 
       <div className="upload-icon">
-        {file ? (
+        {uploadStatus === "uploaded" ? (
           <CheckCircle2 size={24} />
+        ) : uploadStatus === "failed" ? (
+          <X size={24} />
         ) : (
           <Upload size={24} />
         )}
@@ -828,7 +876,7 @@ function DropZone({
               file.size /
               1024 /
               1024
-            ).toFixed(2)} MB · ready`
+            ).toFixed(2)} MB · ${uploadStatus === "uploaded" ? "uploaded" : uploadStatus === "uploading" ? "uploading..." : uploadStatus === "failed" ? "upload failed - select again" : "ready"}`
           : `Upload ${modality} optical image · JPG, PNG, TIFF`}
       </div>
     </label>
@@ -862,20 +910,23 @@ function Correspondence() {
     setTargetUploaded,
   ] = useState(null);
 
+  const [referenceUploadStatus, setReferenceUploadStatus] = useState("idle");
+  const [targetUploadStatus, setTargetUploadStatus] = useState("idle");
+
   const [
     referenceModality,
     setReferenceModality,
-  ] = useState("OHRC");
+  ] = useState("LRO/LROC NAC");
 
   const [
     targetModality,
     setTargetModality,
-  ] = useState("TMC");
+  ] = useState("OHRC");
 
   const [
     matchingStrategy,
     setMatchingStrategy,
-  ] = useState("Hybrid invariant");
+  ] = useState("SIFT + BFMatcher");
 
   const [
     geometricModel,
@@ -916,6 +967,22 @@ function Correspondence() {
     error,
     setError,
   ] = useState("");
+
+  const [failureResult, setFailureResult] = useState(null);
+
+  const [activeStage, setActiveStage] = useState("idle");
+
+  useEffect(() => {
+    const savedSelection = localStorage.getItem("lunaAlginDatasetSelection");
+    if (!savedSelection) return;
+    try {
+      const selection = JSON.parse(savedSelection);
+      if (selection.reference) { setReferenceUploaded(selection.reference); setReferenceUploadStatus("uploaded"); }
+      if (selection.target) { setTargetUploaded(selection.target); setTargetUploadStatus("uploaded"); }
+    } catch {
+      localStorage.removeItem("lunaAlginDatasetSelection");
+    }
+  }, []);
 
   /* -------------------------------------------------------
      UPLOAD
@@ -973,6 +1040,7 @@ function Correspondence() {
   const handleReferenceFile =
     async (file) => {
       setReferenceFile(file);
+      setReferenceUploadStatus("uploading");
       setError("");
       setMessage(
         "Uploading reference image..."
@@ -985,9 +1053,10 @@ function Correspondence() {
         setReferenceUploaded(
           data.filename
         );
+        setReferenceUploadStatus("uploaded");
 
         setMessage(
-          "Reference image uploaded successfully."
+          "Reference lunar base image uploaded successfully."
         );
       } catch (err) {
         setError(
@@ -998,6 +1067,7 @@ function Correspondence() {
         setReferenceUploaded(
           null
         );
+        setReferenceUploadStatus("failed");
       }
     };
 
@@ -1008,6 +1078,7 @@ function Correspondence() {
   const handleTargetFile =
     async (file) => {
       setTargetFile(file);
+      setTargetUploadStatus("uploading");
       setError("");
       setMessage(
         "Uploading moving image..."
@@ -1020,19 +1091,21 @@ function Correspondence() {
         setTargetUploaded(
           data.filename
         );
+        setTargetUploadStatus("uploaded");
 
         setMessage(
-          "Moving image uploaded successfully."
+          "Chandrayaan-2 source image uploaded successfully."
         );
       } catch (err) {
         setError(
           err.message ||
-            "Moving image upload failed."
+            "Chandrayaan-2 source upload failed."
         );
 
         setTargetUploaded(
           null
         );
+        setTargetUploadStatus("failed");
       }
     };
 
@@ -1044,6 +1117,7 @@ function Correspondence() {
     async () => {
       setError("");
       setMessage("");
+      setFailureResult(null);
 
       if (!referenceUploaded) {
         setError(
@@ -1068,7 +1142,7 @@ function Correspondence() {
       try {
         const response =
           await fetch(
-            API.correspondence,
+            API.jobs,
             {
               method: "POST",
               headers: {
@@ -1131,15 +1205,31 @@ function Correspondence() {
           );
         }
 
-        console.log(
-          "LunaAlgin result:",
-          data
-        );
+        const jobId = data.job_id;
+        setActiveStage(data.stage || "queued");
+        let job = data;
+        while (job.status === "queued" || job.status === "processing") {
+          await new Promise((resolve) => setTimeout(resolve, 450));
+          const jobResponse = await fetch(API.job(jobId));
+          job = await readApiJson(jobResponse);
+          if (!jobResponse.ok) throw new Error(getErrorMessage(job, "Unable to read job status."));
+          setActiveStage(job.stage || "processing");
+        }
+        if (job.status === "failed") {
+          const failureResponse = await fetch(API.result(jobId));
+          const failureData = await readApiJson(failureResponse);
+          setFailureResult(failureData);
+          throw new Error(job.error || "Correspondence processing failed.");
+        }
+        const resultResponse = await fetch(API.result(jobId));
+        data = await readApiJson(resultResponse);
+        if (!resultResponse.ok) throw new Error(getErrorMessage(data, "Unable to retrieve completed result."));
 
         localStorage.setItem(
           "lunaAlginResult",
           JSON.stringify(data)
         );
+        saveBenchmark(data);
 
         setMessage(
           `Completed successfully — ${
@@ -1163,8 +1253,24 @@ function Correspondence() {
         );
       } finally {
         setLoading(false);
+        setActiveStage("idle");
       }
     };
+
+  const runSyntheticValidation = async () => {
+    setLoading(true); setError(""); setMessage("Generating a known lunar-like test pair and validating the pipeline...");
+    try {
+      const response = await fetch(API.synthetic, { method: "POST" });
+      const data = await readApiJson(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Synthetic validation failed."));
+      localStorage.setItem("lunaAlginResult", JSON.stringify(data));
+      saveBenchmark(data);
+      navigate("/results");
+    } catch (err) { setError(err.message || "Synthetic validation failed."); }
+    finally { setLoading(false); }
+  };
+
+  const isMatchFailure = /not enough good matches|no features detected|valid .*transformation/i.test(error);
 
   return (
     <div>
@@ -1192,26 +1298,28 @@ function Correspondence() {
 
           <div className="upload-grid">
             <DropZone
-              label="Reference image"
-              modality="fixed/reference"
+              label="Reference lunar base image"
+              modality="fixed coordinate system"
               onFile={
                 handleReferenceFile
               }
+              uploadStatus={referenceUploadStatus}
             />
 
             <DropZone
-              label="Moving image"
+              label="Chandrayaan-2 source image"
               modality="moving/source"
               onFile={
                 handleTargetFile
               }
+              uploadStatus={targetUploadStatus}
             />
           </div>
 
           <div className="form-grid">
             <label>
               <span>
-                Reference modality
+                Reference sensor
               </span>
 
               <select
@@ -1224,23 +1332,15 @@ function Correspondence() {
                   )
                 }
               >
-                <option>
-                  OHRC
-                </option>
-
-                <option>
-                  TMC
-                </option>
-
-                <option>
-                  IIRS
-                </option>
+                <option>LRO/LROC NAC</option>
+                <option>LROC WAC</option>
+                <option>Other lunar base map</option>
               </select>
             </label>
 
             <label>
               <span>
-                Moving modality
+                Chandrayaan-2 source sensor
               </span>
 
               <select
@@ -1253,17 +1353,9 @@ function Correspondence() {
                   )
                 }
               >
-                <option>
-                  TMC
-                </option>
-
-                <option>
-                  OHRC
-                </option>
-
-                <option>
-                  IIRS
-                </option>
+                <option>OHRC</option>
+                <option>TMC-2</option>
+                <option>IIRS</option>
               </select>
             </label>
 
@@ -1283,15 +1375,7 @@ function Correspondence() {
                 }
               >
                 <option>
-                  Hybrid invariant
-                </option>
-
-                <option>
-                  Feature-based
-                </option>
-
-                <option>
-                  Intensity-based
+                  SIFT + BFMatcher
                 </option>
               </select>
             </label>
@@ -1452,7 +1536,36 @@ function Correspondence() {
                 <span>
                   {error}
                 </span>
+                {isMatchFailure && (
+                  <div className="failure-guidance">
+                    <span>These images may not cover the same lunar region. Try an overlapping OHRC/TMC-2 pair, or validate the full software flow with the synthetic test.</span>
+                    <button type="button" className="text-link" onClick={runSyntheticValidation}>Run verified synthetic test <ArrowRight size={14} /></button>
+                  </div>
+                )}
+                {failureResult?.outputs && (
+                  <div className="failure-guidance">
+                    <b>Diagnostic outputs saved for this failed run</b>
+                    <div className="download-actions">
+                      {Object.entries(failureResult.outputs).map(([label, path]) => <a className="ghost-btn" key={label} href={`${BACKEND_URL}${path}`} download>{label.replaceAll("_", " ")}</a>)}
+                    </div>
+                  </div>
+                )}
               </div>
+            </div>
+          )}
+
+          {loading && (
+            <div className="pipeline-live" aria-live="polite">
+              {[
+                ["metadata", "Metadata validation"], ["preprocessing", "Preprocessing"],
+                ["features", "Feature detection"], ["matching", "Feature matching"],
+                ["geometry", "RANSAC geometry"], ["registration", "Registration"],
+                ["metrics", "Quality metrics"], ["visualization", "Visualization"],
+              ].map(([id, label]) => (
+                <div key={id} className={activeStage === id ? "active" : ""}>
+                  <span>{activeStage === id ? "●" : "○"}</span>{label}
+                </div>
+              ))}
             </div>
           )}
 
@@ -1468,6 +1581,9 @@ function Correspondence() {
             {loading
               ? "Processing..."
               : "Run correspondence"}
+          </button>
+          <button className="ghost-btn full synthetic-btn" onClick={runSyntheticValidation} disabled={loading}>
+            <ScanSearch size={17} /> Run synthetic ground-truth test
           </button>
         </div>
 
@@ -1495,7 +1611,7 @@ function Correspondence() {
               <span>
                 {loading
                   ? "Processing..."
-                  : "Registration preview"}
+                  : "Source → reference registration preview"}
               </span>
             </div>
           </div>
@@ -1546,8 +1662,13 @@ function Correspondence() {
 ========================================================= */
 
 function Datasets() {
+  const navigate = useNavigate();
   const [datasets, setDatasets] =
     useState([]);
+
+  const [sensorFilter, setSensorFilter] = useState("All");
+  const [dateFilter, setDateFilter] = useState("");
+  const [selectedDataset, setSelectedDataset] = useState(null);
 
   const [loading, setLoading] =
     useState(true);
@@ -1683,6 +1804,19 @@ function Datasets() {
         )
     ).size;
 
+  const filteredDatasets = datasets.filter((dataset) => {
+    const matchesSensor = sensorFilter === "All" || dataset.sensor === sensorFilter;
+    const date = dataset.acquisition?.date || "";
+    return matchesSensor && (!dateFilter || date.startsWith(dateFilter));
+  });
+
+  const selectForRun = (dataset, role) => {
+    const current = JSON.parse(localStorage.getItem("lunaAlginDatasetSelection") || "{}");
+    current[role] = dataset.filename;
+    localStorage.setItem("lunaAlginDatasetSelection", JSON.stringify(current));
+    navigate("/correspondence");
+  };
+
   return (
     <div>
       <SectionTitle
@@ -1789,6 +1923,18 @@ function Datasets() {
           </span>
         </div>
 
+        <div className="catalog-filters">
+          <label>Sensor
+            <select value={sensorFilter} onChange={(event) => setSensorFilter(event.target.value)}>
+              <option>All</option><option>OHRC</option><option>TMC-2</option><option>IIRS</option><option>Unknown</option>
+            </select>
+          </label>
+          <label>Acquisition date
+            <input type="date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} />
+          </label>
+          <span className="count">{filteredDatasets.length} matching</span>
+        </div>
+
         {loading ? (
           <div className="empty-state">
             <Activity size={28} />
@@ -1863,11 +2009,15 @@ function Datasets() {
                   <th>
                     Status
                   </th>
+
+                  <th>
+                    Actions
+                  </th>
                 </tr>
               </thead>
 
               <tbody>
-                {datasets.map(
+                {filteredDatasets.map(
                   (dataset) => {
                     const sunAzimuth =
                       dataset
@@ -2006,6 +2156,12 @@ function Datasets() {
                             }
                           </span>
                         </td>
+
+                        <td className="dataset-actions">
+                          <button className="table-action" onClick={() => setSelectedDataset(dataset)}>Details</button>
+                          <button className="table-action" onClick={() => selectForRun(dataset, "reference")}>Reference</button>
+                          <button className="table-action" onClick={() => selectForRun(dataset, "target")}>Target</button>
+                        </td>
                       </tr>
                     );
                   }
@@ -2015,6 +2171,23 @@ function Datasets() {
           </div>
         )}
       </div>
+
+      {selectedDataset && (
+        <div className="metadata-modal" role="dialog" aria-modal="true">
+          <div className="metadata-card panel">
+            <button className="icon-btn metadata-close" onClick={() => setSelectedDataset(null)} aria-label="Close metadata"><X size={18} /></button>
+            <span className="eyebrow">DATASET METADATA</span>
+            <h3>{selectedDataset.product_id}</h3>
+            <img src={`${BACKEND_URL}${selectedDataset.input_url}`} alt={selectedDataset.filename} className="metadata-preview" />
+            <div className="metadata-grid">
+              <span>Sensor<b>{selectedDataset.sensor}</b></span><span>Acquisition<b>{formatAcquisition(selectedDataset)}</b></span>
+              <span>Dimensions<b>{selectedDataset.spatial?.dimensions || "—"}</b></span><span>Resolution<b>{formatResolution(selectedDataset.spatial?.resolution_m_per_pixel)}</b></span>
+              <span>Sun azimuth<b>{formatSunAngle(selectedDataset.illumination?.sun_azimuth_deg)}</b></span><span>Sun elevation<b>{formatSunAngle(selectedDataset.illumination?.sun_elevation_deg)}</b></span>
+              <span>Latitude<b>{selectedDataset.geolocation?.latitude ?? "—"}</b></span><span>Longitude<b>{selectedDataset.geolocation?.longitude ?? "—"}</b></span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="success-box">
         <ShieldCheck size={18} />
@@ -2045,6 +2218,7 @@ function Datasets() {
 function Results() {
   const [result, setResult] =
     useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
 
   const loadResult = () => {
     const savedResult =
@@ -2142,6 +2316,24 @@ function Results() {
       ? `${BACKEND_URL}${result.outputs.difference_map}`
       : "";
 
+  const referencePreprocessed = result.outputs?.reference_preprocessed
+    ? `${BACKEND_URL}${result.outputs.reference_preprocessed}` : "";
+  const targetPreprocessed = result.outputs?.target_preprocessed
+    ? `${BACKEND_URL}${result.outputs.target_preprocessed}` : "";
+
+  const generateReport = async () => {
+    setReportLoading(true);
+    try {
+      const response = await fetch(API.report(result.job_id), { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(getErrorMessage(data, "Report generation failed."));
+      const updated = { ...result, outputs: { ...result.outputs, report: data.report_url } };
+      setResult(updated); localStorage.setItem("lunaAlginResult", JSON.stringify(updated));
+      window.open(`${BACKEND_URL}${data.report_url}`, "_blank", "noopener,noreferrer");
+    } catch (error) { window.alert(error.message || "Report generation failed."); }
+    finally { setReportLoading(false); }
+  };
+
   const inlierRatio =
     result.geometry
       ?.inlier_ratio ?? 0;
@@ -2149,6 +2341,8 @@ function Results() {
   const alignmentScore =
     result.registration
       ?.alignment_score ?? 0;
+
+  const confidenceScore = result.confidence?.score ?? 0;
 
   const qualityMetrics =
     result.registration
@@ -2501,6 +2695,24 @@ function Results() {
         </div>
       </div>
 
+      <div className="panel">
+        <div className="card-head">
+          <div>
+            <span className="eyebrow">ILLUMINATION NORMALIZATION</span>
+            <h3>Preprocessing evidence</h3>
+          </div>
+          <Sun size={19} />
+        </div>
+        <p className="panel-note">
+          Original uploaded imagery is shown in the dataset catalog. These are the grayscale, denoised, illumination-normalized and contrast-enhanced images used for feature extraction.
+          {result.processing?.sun_angle_compensation ? " Metadata-guided sun-angle compensation was enabled." : " Sun-angle compensation was disabled for this run."}
+        </p>
+        <div className="image-comparison-grid">
+          <div><b>Reference — processed</b>{referencePreprocessed ? <img src={referencePreprocessed} alt="Preprocessed reference lunar image" /> : <span>Unavailable</span>}</div>
+          <div><b>Target — processed</b>{targetPreprocessed ? <img src={targetPreprocessed} alt="Preprocessed target lunar image" /> : <span>Unavailable</span>}</div>
+        </div>
+      </div>
+
       <div className="result-grid">
         <div className="panel">
           <div className="card-head">
@@ -2662,9 +2874,8 @@ function Results() {
               <b>
                 RANSAC threshold
               </b>
-              {result.parameters
+              {result.processing
                 ?.reprojection_threshold ??
-                result.reprojection_threshold ??
                 5}{" "}
               px
             </span>
@@ -2817,8 +3028,77 @@ function Results() {
           </span>
         </div>
       </div>
+
+      {result.validation && (
+        <div className="panel validation-panel">
+          <span className="eyebrow">GROUND-TRUTH VALIDATION</span>
+          <h3>Synthetic transformation recovery</h3>
+          <div className="stats-grid">
+            <StatCard icon={Gauge} label="Corner RMSE" value={`${result.validation.corner_rmse_px} px`} detail="estimated vs known transform" />
+            <StatCard icon={CheckCircle2} label="Test conditions" value="KNOWN" detail={result.validation.test_conditions} />
+          </div>
+        </div>
+      )}
+
+      <div className="panel run-summary">
+        <div>
+          <span className="eyebrow">LUNAALGIN CONFIDENCE</span>
+          <h3>{confidenceScore}%</h3>
+          <p>LunaAlgin-derived confidence combines geometric consistency, reprojection accuracy and image alignment.</p>
+        </div>
+        <div className="success-indicator"><Gauge size={20} /><span>{result.processing_time_seconds ?? 0}s processing</span></div>
+      </div>
+
+      <div className="download-actions">
+        <button className="primary-btn" onClick={generateReport} disabled={reportLoading}>{reportLoading ? "Generating report..." : "Download scientific PDF report"}</button>
+        {[
+          ["Aligned image", alignedImage],
+          ["Match map", correspondenceMap],
+          ["Difference map", differenceMap],
+          ["Reference preprocessing", referencePreprocessed],
+          ["Target preprocessing", targetPreprocessed],
+          ["Metadata JSON", result.outputs?.metadata ? `${BACKEND_URL}${result.outputs.metadata}` : ""],
+          ["Result JSON", result.outputs?.result ? `${BACKEND_URL}${result.outputs.result}` : ""],
+          ["Scientific PDF report", result.outputs?.report ? `${BACKEND_URL}${result.outputs.report}` : ""],
+        ].filter(([, url]) => url).map(([label, url]) => (
+          <a className="ghost-btn" href={url} download key={label}>{label}</a>
+        ))}
+      </div>
     </div>
   );
+}
+
+/* =========================================================
+   BENCHMARKS
+========================================================= */
+
+function Benchmarks() {
+  const [records, setRecords] = useState(() => JSON.parse(localStorage.getItem("lunaAlginBenchmarks") || "[]"));
+
+  const exportCsv = () => {
+    const headers = ["Experiment", "Date", "Matches", "Inliers", "Inlier %", "RMSE", "SSIM", "NCC", "Mean reprojection px", "Corner RMSE px"];
+    const rows = records.map((r) => [r.label, new Date(r.createdAt).toLocaleString(), r.matches, r.inliers, r.inlierRatio, r.rmse ?? "", r.ssim ?? "", r.ncc ?? "", r.reprojectionError ?? "", r.cornerRmse ?? ""]);
+    const csv = [headers, ...rows].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    const link = document.createElement("a"); link.href = url; link.download = "lunaalgin-benchmarks.csv"; link.click(); URL.revokeObjectURL(url);
+  };
+
+  const clearRecords = () => { localStorage.removeItem("lunaAlginBenchmarks"); setRecords([]); };
+
+  return <div>
+    <SectionTitle eyebrow="QUANTITATIVE VALIDATION" title="Benchmark experiments" desc="Only completed LunaAlgin runs are recorded here. No estimated values."
+      action={<div className="benchmark-actions"><button className="ghost-btn" onClick={exportCsv} disabled={!records.length}>Export CSV</button><button className="ghost-btn" onClick={clearRecords} disabled={!records.length}>Clear history</button></div>} />
+    <div className="stats-grid">
+      <StatCard icon={BarChart3} label="Completed runs" value={records.length} detail="locally recorded" />
+      <StatCard icon={ShieldCheck} label="Best inlier ratio" value={records.length ? `${Math.max(...records.map((r) => r.inlierRatio))}%` : "—"} detail="actual measurement" />
+      <StatCard icon={Gauge} label="Best synthetic RMSE" value={records.some((r) => r.cornerRmse !== null) ? `${Math.min(...records.filter((r) => r.cornerRmse !== null).map((r) => r.cornerRmse))} px` : "—"} detail="corner recovery error" />
+    </div>
+    <div className="panel table-panel">
+      <div className="card-head"><div><span className="eyebrow">EXPERIMENT LOG</span><h3>Measured results</h3></div><span className="count">{records.length} runs</span></div>
+      {!records.length ? <div className="empty-state"><BarChart3 size={32} /><h3>No benchmark runs yet</h3><p>Run the synthetic ground-truth test or a real correspondence pair to create an entry.</p><NavLink className="primary-btn" to="/correspondence"><Rocket size={17} /> Start test</NavLink></div> :
+        <div className="table-wrap"><table><thead><tr><th>Experiment</th><th>Matches</th><th>Inliers</th><th>Inlier %</th><th>RMSE</th><th>SSIM</th><th>NCC</th><th>Reprojection</th><th>Corner RMSE</th></tr></thead><tbody>{records.map((r) => <tr key={r.jobId}><td><b>{r.label}</b><small className="table-date">{new Date(r.createdAt).toLocaleString()}</small></td><td>{r.matches}</td><td>{r.inliers}</td><td>{r.inlierRatio}%</td><td>{r.rmse ?? "—"}</td><td>{r.ssim ?? "—"}</td><td>{r.ncc ?? "—"}</td><td>{r.reprojectionError !== null ? `${r.reprojectionError} px` : "—"}</td><td>{r.cornerRmse !== null ? `${r.cornerRmse} px` : "—"}</td></tr>)}</tbody></table></div>}
+    </div>
+  </div>;
 }
 
 /* =========================================================
@@ -2838,17 +3118,17 @@ function Settings() {
         {[
           [
             "Default detector",
-            "SIFT / SuperPoint hybrid",
+            "SIFT multi-scale",
             "Feature extraction",
           ],
           [
             "Matcher",
-            "FLANN + ratio test",
+            "BFMatcher + Lowe ratio test",
             "Descriptor matching",
           ],
           [
             "RANSAC threshold",
-            "3.0 px",
+            "5.0 px (configurable per run)",
             "Geometric verification",
           ],
           [
@@ -2910,6 +3190,11 @@ export default function App() {
         <Route
           path="/results"
           element={<Results />}
+        />
+
+        <Route
+          path="/benchmarks"
+          element={<Benchmarks />}
         />
 
         <Route

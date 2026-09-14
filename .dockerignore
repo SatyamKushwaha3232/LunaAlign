@@ -1,0 +1,8 @@
+node_modules
+dist
+.git
+.venv
+backend/venv
+backend/data/input
+backend/data/output
+tmp

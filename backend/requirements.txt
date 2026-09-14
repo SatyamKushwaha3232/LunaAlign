@@ -1,0 +1,9 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+python-multipart==0.0.32
+opencv-python-headless==4.13.0.92
+numpy==2.5.3
+scikit-image==0.26.0
+reportlab==5.0.1
+pymongo[srv]==4.16.0
+python-dotenv==1.2.2

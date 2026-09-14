@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    volumes:
+      - luna_data:/app/data
+
+  frontend:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  luna_data:

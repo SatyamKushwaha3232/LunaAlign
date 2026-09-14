@@ -1,7 +1,12 @@
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime, timezone
+import json
+import time
+from threading import Thread
 
 import cv2
+import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -22,6 +27,9 @@ from processing.visualization import (
     create_difference_visualization,
 )
 from processing.metrics import calculate_quality_metrics
+from processing.report import create_scientific_report
+from api.upload import build_dataset_metadata
+from database import create_job, get_job as get_saved_job, update_job
 
 
 # =============================================================
@@ -50,6 +58,20 @@ OUTPUT_DIR.mkdir(
     parents=True,
     exist_ok=True,
 )
+
+JOBS = {}
+
+PIPELINE_STAGES = [
+    "queued", "metadata", "preprocessing", "features", "matching",
+    "geometry", "registration", "metrics", "visualization", "completed",
+]
+
+
+def set_job_stage(job_id, stage):
+    if job_id and job_id in JOBS:
+        JOBS[job_id].update({"status": "processing", "stage": stage})
+    if job_id:
+        update_job(job_id, status="processing", stage=stage)
 
 
 # =============================================================
@@ -101,6 +123,11 @@ class CorrespondenceRequest(BaseModel):
     )
 
     geometric_model: str = "homography"
+
+    reference_modality: str | None = None
+    target_modality: str | None = None
+    sun_angle_compensation: bool = True
+    scale_aware_matching: bool = True
 
 
 # =============================================================
@@ -203,8 +230,11 @@ def get_minimum_matches(
 @router.post("")
 def calculate_correspondence(
     request: CorrespondenceRequest,
+    job_id: str | None = None,
 ):
 
+    started_at = time.perf_counter()
+    job_id = job_id or str(uuid4())
     # =========================================================
     # 0. VALIDATE GEOMETRIC MODEL
     # =========================================================
@@ -270,21 +300,21 @@ def calculate_correspondence(
         )
 
     # =========================================================
+    set_job_stage(job_id, "metadata")
     # 2. PREPROCESSING
     # =========================================================
 
+    set_job_stage(job_id, "preprocessing")
     try:
 
-        reference_processed = (
-            preprocess_image(
-                str(reference_path)
-            )
-        )
-
-        target_processed = (
-            preprocess_image(
-                str(target_path)
-            )
+        reference_metadata = build_dataset_metadata(reference_path)
+        target_metadata = build_dataset_metadata(target_path)
+        reference_processed = preprocess_image(str(reference_path))
+        target_processed = preprocess_image(
+            str(target_path),
+            reference_metadata.get("illumination"),
+            target_metadata.get("illumination"),
+            request.sun_angle_compensation,
         )
 
         reference_image = (
@@ -313,6 +343,7 @@ def calculate_correspondence(
     # 3. MULTI-SCALE FEATURE EXTRACTION
     # =========================================================
 
+    set_job_stage(job_id, "features")
     try:
 
         (
@@ -320,7 +351,7 @@ def calculate_correspondence(
             reference_descriptors,
         ) = extract_multiscale_features(
             reference_image,
-            scales=request.scales,
+            scales=request.scales if request.scale_aware_matching else (1.0,),
         )
 
         (
@@ -328,7 +359,7 @@ def calculate_correspondence(
             target_descriptors,
         ) = extract_multiscale_features(
             target_image,
-            scales=request.scales,
+            scales=request.scales if request.scale_aware_matching else (1.0,),
         )
 
     except Exception as error:
@@ -369,6 +400,7 @@ def calculate_correspondence(
     # 5. FEATURE MATCHING
     # =========================================================
 
+    set_job_stage(job_id, "matching")
     try:
 
         good_matches = match_descriptors(
@@ -424,6 +456,7 @@ def calculate_correspondence(
     # 7. GEOMETRIC TRANSFORMATION + RANSAC
     # =========================================================
 
+    set_job_stage(job_id, "geometry")
     try:
 
         (
@@ -503,6 +536,7 @@ def calculate_correspondence(
     # 9. IMAGE REGISTRATION
     # =========================================================
 
+    set_job_stage(job_id, "registration")
     try:
 
         reference_height, reference_width = (
@@ -532,6 +566,7 @@ def calculate_correspondence(
     # 10. SCIENTIFIC QUALITY METRICS
     # =========================================================
 
+    set_job_stage(job_id, "metrics")
     try:
 
         quality_metrics = (
@@ -580,22 +615,15 @@ def calculate_correspondence(
     # 12. CREATE JOB ID
     # =========================================================
 
-    job_id = str(uuid4())
+    set_job_stage(job_id, "visualization")
 
-    aligned_path = (
-        OUTPUT_DIR
-        / f"{job_id}_aligned.png"
-    )
-
-    correspondence_path = (
-        OUTPUT_DIR
-        / f"{job_id}_correspondence.png"
-    )
-
-    difference_path = (
-        OUTPUT_DIR
-        / f"{job_id}_difference.png"
-    )
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    aligned_path = job_dir / "aligned.png"
+    correspondence_path = job_dir / "matches.png"
+    difference_path = job_dir / "difference.png"
+    reference_preprocessed_path = job_dir / "reference_preprocessed.png"
+    target_preprocessed_path = job_dir / "target_preprocessed.png"
 
     # =========================================================
     # 13. SAVE ALIGNED IMAGE
@@ -615,6 +643,11 @@ def calculate_correspondence(
                 "aligned image."
             ),
         )
+
+    if not cv2.imwrite(str(reference_preprocessed_path), reference_image):
+        raise HTTPException(status_code=500, detail="Unable to save reference preprocessing preview.")
+    if not cv2.imwrite(str(target_preprocessed_path), target_image):
+        raise HTTPException(status_code=500, detail="Unable to save target preprocessing preview.")
 
     # =========================================================
     # 14. CREATE CORRESPONDENCE MAP
@@ -670,7 +703,13 @@ def calculate_correspondence(
     # 16. FINAL RESPONSE
     # =========================================================
 
-    return {
+    reprojection_mean = geometry_summary["reprojection_error"]["mean_error"]
+    confidence = round(max(0, min(100, (
+        geometry_summary["inlier_ratio"] * 0.55
+        + alignment_score * 0.20
+        + max(0, 100 - reprojection_mean * 10) * 0.25
+    ))), 2)
+    result = {
 
         "status": "completed",
 
@@ -702,11 +741,11 @@ def calculate_correspondence(
                 "SIFT Multi-Scale"
             ),
 
-            "scales": list(
-                request.scales
-            ),
+            "scales": list(request.scales if request.scale_aware_matching else (1.0,)),
 
             "illumination_normalization": True,
+            "sun_angle_compensation": request.sun_angle_compensation,
+            "scale_aware_matching": request.scale_aware_matching,
 
             "ratio_threshold": (
                 request.ratio_threshold
@@ -806,6 +845,10 @@ def calculate_correspondence(
 
         },
 
+        "metadata": {"reference": reference_metadata, "target": target_metadata},
+        "confidence": {"label": "LunaAlgin-derived confidence", "score": confidence},
+        "processing_time_seconds": round(time.perf_counter() - started_at, 2),
+
         # -----------------------------------------------------
         # OUTPUT FILES
         # -----------------------------------------------------
@@ -813,20 +856,147 @@ def calculate_correspondence(
         "outputs": {
 
             "aligned_image": (
-                f"/outputs/"
-                f"{aligned_path.name}"
+                f"/outputs/{job_id}/aligned.png"
             ),
 
             "correspondence_map": (
-                f"/outputs/"
-                f"{correspondence_path.name}"
+                f"/outputs/{job_id}/matches.png"
             ),
 
             "difference_map": (
-                f"/outputs/"
-                f"{difference_path.name}"
+                f"/outputs/{job_id}/difference.png"
             ),
+
+            "reference_preprocessed": f"/outputs/{job_id}/reference_preprocessed.png",
+            "target_preprocessed": f"/outputs/{job_id}/target_preprocessed.png",
 
         },
 
     }
+    result["outputs"].update({
+        "metadata": f"/outputs/{job_id}/metadata.json",
+        "metrics": f"/outputs/{job_id}/metrics.json",
+        "result": f"/outputs/{job_id}/result.json",
+    })
+    (job_dir / "metadata.json").write_text(json.dumps(result["metadata"], indent=2), encoding="utf-8")
+    (job_dir / "metrics.json").write_text(json.dumps(result["registration"]["quality_metrics"], indent=2), encoding="utf-8")
+    (job_dir / "transformation.json").write_text(json.dumps(result["transformation"], indent=2), encoding="utf-8")
+    (job_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    JOBS[job_id] = {"status": "completed", "stage": "completed", "completed_at": datetime.now(timezone.utc).isoformat(), "result": result}
+    update_job(job_id, status="completed", stage="completed", completed_at=datetime.now(timezone.utc), result=result)
+    return result
+
+
+def _run_correspondence_job(job_id, request):
+    try:
+        calculate_correspondence(request, job_id=job_id)
+    except HTTPException as error:
+        _save_failure_result(job_id, request, str(error.detail))
+    except Exception as error:
+        _save_failure_result(job_id, request, str(error))
+
+
+def _save_failure_result(job_id, request, reason):
+    """Persist useful diagnostic output for an unsuccessful run."""
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {"diagnostic": f"/outputs/{job_id}/failure.json"}
+    for role, filename in (("reference", request.reference_filename), ("target", request.target_filename)):
+        source = INPUT_DIR / Path(filename).name
+        try:
+            processed = preprocess_image(str(source))["enhanced"]
+            artifact = f"{role}_preprocessed.png"
+            cv2.imwrite(str(job_dir / artifact), processed)
+            outputs[f"{role}_preprocessed"] = f"/outputs/{job_id}/{artifact}"
+        except Exception:
+            pass
+    result = {
+        "status": "failed", "job_id": job_id,
+        "input": {"reference": Path(request.reference_filename).name, "target": Path(request.target_filename).name},
+        "error": {"message": reason, "guidance": "Choose images with an overlapping lunar footprint, or use the synthetic ground-truth test to validate the pipeline."},
+        "outputs": outputs,
+    }
+    (job_dir / "failure.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    JOBS[job_id] = {"status": "failed", "stage": "failed", "error": reason, "result": result}
+    update_job(job_id, status="failed", stage="failed", error=reason, result=result)
+
+
+@router.post("/jobs")
+def start_correspondence_job(request: CorrespondenceRequest):
+    job_id = str(uuid4())
+    JOBS[job_id] = {"status": "queued", "stage": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    create_job(job_id)
+    Thread(target=_run_correspondence_job, args=(job_id, request), daemon=True).start()
+    return {"status": "queued", "job_id": job_id, "stage": "queued", "stages": PIPELINE_STAGES}
+
+
+def create_synthetic_lunar_scene(width=900, height=650):
+    """Create a deterministic crater-texture scene for ground-truth validation."""
+    rng = np.random.default_rng(26166)
+    scene = rng.normal(92, 18, (height, width)).clip(0, 255).astype(np.uint8)
+    scene = cv2.GaussianBlur(scene, (0, 0), 1.2)
+    for _ in range(140):
+        x, y = int(rng.integers(20, width - 20)), int(rng.integers(20, height - 20))
+        radius = int(rng.integers(4, 28))
+        cv2.circle(scene, (x, y), radius, int(rng.integers(45, 100)), -1, cv2.LINE_AA)
+        cv2.circle(scene, (x - radius // 4, y - radius // 4), radius, int(rng.integers(110, 180)), 1, cv2.LINE_AA)
+    return cv2.normalize(scene, None, 0, 255, cv2.NORM_MINMAX)
+
+
+@router.post("/synthetic")
+def run_synthetic_validation():
+    """Run the production pipeline on a known transform; no external data needed."""
+    reference = create_synthetic_lunar_scene()
+    forward = np.array([[0.93, -0.12, 61.0], [0.12, 0.93, -34.0], [0.00003, -0.00002, 1.0]], dtype=np.float32)
+    target = cv2.warpPerspective(reference, forward, (reference.shape[1], reference.shape[0]))
+    target = cv2.convertScaleAbs(target, alpha=1.10, beta=8)
+    reference_name, target_name = "synthetic_reference.png", "synthetic_target.png"
+    cv2.imwrite(str(INPUT_DIR / reference_name), reference)
+    cv2.imwrite(str(INPUT_DIR / target_name), target)
+    result = calculate_correspondence(CorrespondenceRequest(
+        reference_filename=reference_name, target_filename=target_name,
+        geometric_model="homography", ratio_threshold=0.75, reprojection_threshold=5.0,
+    ))
+    expected = np.linalg.inv(forward)
+    estimated = np.array(result["transformation"]["matrix"], dtype=np.float64)
+    corners = np.float32([[[0, 0], [reference.shape[1], 0], [reference.shape[1], reference.shape[0]], [0, reference.shape[0]]]])
+    expected_corners = cv2.perspectiveTransform(corners, expected)[0]
+    estimated_corners = cv2.perspectiveTransform(corners, estimated)[0]
+    result["validation"] = {
+        "type": "synthetic ground truth",
+        "known_transform": expected.round(6).tolist(),
+        "corner_rmse_px": round(float(np.sqrt(np.mean((expected_corners - estimated_corners) ** 2))), 4),
+        "test_conditions": "rotation, scale, translation, perspective and brightness variation",
+    }
+    job_dir = OUTPUT_DIR / result["job_id"]
+    (job_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    JOBS[result["job_id"]]["result"] = result
+    return result
+
+
+@router.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    job = JOBS.get(job_id) or get_saved_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {key: value for key, value in job.items() if key != "result"}
+
+
+@router.get("/results/{job_id}")
+def get_result(job_id: str):
+    job = JOBS.get(job_id) or get_saved_job(job_id, include_result=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job["result"]
+
+
+@router.post("/report/{job_id}")
+def generate_report(job_id: str):
+    job = JOBS.get(job_id) or get_saved_job(job_id, include_result=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found. Run correspondence before requesting a report.")
+    report_path = create_scientific_report(job["result"], OUTPUT_DIR / job_id)
+    job["result"]["outputs"]["report"] = f"/outputs/{job_id}/{report_path.name}"
+    (OUTPUT_DIR / job_id / "result.json").write_text(json.dumps(job["result"], indent=2), encoding="utf-8")
+    update_job(job_id, result=job["result"])
+    return {"status": "completed", "report_url": job["result"]["outputs"]["report"]}

@@ -37,7 +37,10 @@ def register_image(
     registered_image = cv2.warpPerspective(
         target_image,
         homography,
-        (width, height)
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
     )
 
     return registered_image

@@ -97,7 +97,27 @@ def enhance_contrast(gray):
     return enhanced
 
 
-def preprocess_image(image_path: str):
+def apply_sun_angle_compensation(image, reference_illumination, target_illumination):
+    """Apply a deliberately conservative metadata-guided gain correction.
+
+    It is only used when both products provide sun elevation metadata.  The
+    Retinex/CLAHE pipeline remains the primary normalisation, while this small
+    correction reduces gross exposure differences without inventing metadata.
+    """
+    if not reference_illumination or not target_illumination:
+        return image
+    reference_elevation = reference_illumination.get("sun_elevation_deg")
+    target_elevation = target_illumination.get("sun_elevation_deg")
+    if reference_elevation is None or target_elevation is None:
+        return image
+    target_signal = max(np.sin(np.deg2rad(float(target_elevation))), 0.15)
+    reference_signal = max(np.sin(np.deg2rad(float(reference_elevation))), 0.15)
+    gain = np.clip(reference_signal / target_signal, 0.65, 1.55)
+    return cv2.convertScaleAbs(image, alpha=float(gain))
+
+
+def preprocess_image(image_path: str, reference_illumination=None,
+                     target_illumination=None, compensate_sun_angle=False):
     """
     Complete LunaAlgin preprocessing pipeline.
 
@@ -132,6 +152,10 @@ def preprocess_image(image_path: str):
     )
 
     enhanced = enhance_contrast(normalized)
+    if compensate_sun_angle:
+        enhanced = apply_sun_angle_compensation(
+            enhanced, reference_illumination, target_illumination
+        )
 
     return {
         "original": image,

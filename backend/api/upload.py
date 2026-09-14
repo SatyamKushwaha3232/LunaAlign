@@ -1,11 +1,13 @@
 from pathlib import Path
 import re
 import shutil
+from uuid import uuid4
 
 import cv2
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from processing.metadata import parse_pds_xml
+from database import list_saved_datasets, mongo_enabled, save_dataset
 
 router = APIRouter(
     prefix="/api/v1/datasets",
@@ -18,6 +20,7 @@ INPUT_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".tif", ".tiff"
 }
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 def detect_sensor(filename: str):
@@ -42,6 +45,9 @@ def detect_sensor(filename: str):
 
     if "IIRS" in name:
         return "IIRS"
+
+    if "LROC" in name or "LRO" in name or "NAC" in name:
+        return "LRO/LROC NAC"
 
     return "Unknown"
 
@@ -346,27 +352,47 @@ async def upload_dataset(
 
     safe_name = Path(file.filename).name
 
+    # Avoid overwriting an earlier dataset with the same browser filename.
     output_path = INPUT_DIR / safe_name
+    if output_path.exists():
+        output_path = INPUT_DIR / f"{output_path.stem}_{uuid4().hex[:8]}{output_path.suffix}"
 
     try:
         with output_path.open("wb") as buffer:
             shutil.copyfileobj(
                 file.file,
-                buffer
+                buffer,
+                length=1024 * 1024,
             )
+            if buffer.tell() > MAX_UPLOAD_BYTES:
+                buffer.close()
+                output_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Image exceeds the 100 MB upload limit.")
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=500,
             detail=f"Unable to save uploaded image: {error}"
         )
 
+    if cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED) is None:
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="The uploaded file is corrupted or is not a supported image.")
+
     metadata = build_dataset_metadata(
         output_path
     )
+    if mongo_enabled():
+        try:
+            save_dataset(metadata)
+        except Exception as error:
+            output_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=503, detail=f"MongoDB unavailable; upload was not saved: {error}")
 
     return {
         "status": "uploaded",
-        "filename": safe_name,
+        "filename": output_path.name,
         "path": str(output_path),
         "metadata": metadata,
         "message": "Lunar image uploaded successfully.",
@@ -379,6 +405,13 @@ def list_datasets():
     Return all uploaded lunar images
     with SIH26166-oriented metadata.
     """
+
+    if mongo_enabled():
+        try:
+            datasets = list_saved_datasets()
+            return {"status": "success", "count": len(datasets), "datasets": datasets}
+        except Exception as database_error:
+            raise HTTPException(status_code=503, detail=f"MongoDB unavailable: {database_error}")
 
     datasets = []
 
