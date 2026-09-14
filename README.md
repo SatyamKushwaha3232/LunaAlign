@@ -21,6 +21,7 @@ cd backend
 In a second terminal:
 
 ```powershell
+cd frontend
 npm install
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
@@ -68,3 +69,7 @@ The archive is PDS4-based and requires login for product downloads. The [ISSDC C
 Use **Run synthetic ground-truth test** from the Correspondence page when real imagery is not yet available. It creates a deterministic lunar-like crater scene, applies a known transformation, and reports corner RMSE between the recovered and known transforms. On Results, select **Download scientific PDF report** to create a job-specific report containing input metadata, metrics, transformation, confidence, output maps, and (when applicable) synthetic validation.
 
 MongoDB is optional for the offline demo and defaults to disabled. Set `MONGODB_ENABLED=true` in `backend/.env` only after your Atlas credentials have been verified.
+
+## Vercel deployment
+
+Deploy the `frontend` directory as the Vercel project root. Add `VITE_API_BASE_URL` in Vercel Environment Variables with the public Render backend URL.
