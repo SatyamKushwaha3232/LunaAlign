@@ -335,7 +335,7 @@ function Layout({ children }) {
             </button>
 
             <div className="avatar">
-              SK
+              CO
             </div>
           </div>
         </header>
