@@ -383,18 +383,28 @@ async def upload_dataset(
     metadata = build_dataset_metadata(
         output_path
     )
+    # Atlas is for persistence, not a prerequisite for image processing. A
+    # transient Atlas/DNS/network outage must not reject a valid upload.
+    database_status = "disabled"
+    database_warning = None
     if mongo_enabled():
-        try:
-            save_dataset(metadata)
-        except Exception as error:
-            output_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=503, detail=f"MongoDB unavailable; upload was not saved: {error}")
+        if save_dataset(metadata):
+            database_status = "saved"
+        else:
+            database_status = "unavailable"
+            database_warning = (
+                "MongoDB metadata sync is temporarily unavailable. "
+                "This image was saved locally and can still be used for correspondence."
+            )
+            metadata["database_warning"] = database_warning
 
     return {
         "status": "uploaded",
         "filename": output_path.name,
         "path": str(output_path),
         "metadata": metadata,
+        "database_status": database_status,
+        "database_warning": database_warning,
         "message": "Lunar image uploaded successfully.",
     }
 
@@ -410,8 +420,9 @@ def list_datasets():
         try:
             datasets = list_saved_datasets()
             return {"status": "success", "count": len(datasets), "datasets": datasets}
-        except Exception as database_error:
-            raise HTTPException(status_code=503, detail=f"MongoDB unavailable: {database_error}")
+        except Exception:
+            # Keep the Datasets page available when Atlas is temporarily down.
+            pass
 
     datasets = []
 
